@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Go2 Air Local Control</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-one"></div>
+    <div class="bg-shape bg-two"></div>
+
+    <main class="app-shell">
+      <section class="panel video-panel">
+        <div class="video-wrap">
+          <img id="videoFeed" alt="Robot camera feed" />
+          <div id="videoOverlay">No video yet</div>
+        </div>
+        <p id="videoMeta">Waiting for connection...</p>
+      </section>
+
+      <section class="panel connection">
+        <h2>Connection</h2>
+        <label for="ipInput">Robot IP</label>
+        <input id="ipInput" type="text" value="10.174.16.11" spellcheck="false" />
+
+        <label for="aesInput">AES Key (optional)</label>
+        <input
+          id="aesInput"
+          type="text"
+          value="5a68577e2d43f36b76f3252a6e48af9d"
+          placeholder="Required on Go2 firmware >= 1.1.15"
+          spellcheck="false"
+        />
+
+        <div class="button-row">
+          <button id="connectBtn" class="btn btn-primary">Connect</button>
+          <button id="disconnectBtn" class="btn btn-outline">Disconnect</button>
+        </div>
+
+        <div id="statusBadge" class="status offline">Disconnected</div>
+      </section>
+
+      <section class="panel voice">
+        <h2>Voice And Agent</h2>
+        <p>Voice examples: "Go forward", "Stop", "Go to the bottle".</p>
+        <div class="button-row">
+          <button id="startVoiceBtn" class="btn btn-primary">Start Listening</button>
+          <button id="stopVoiceBtn" class="btn btn-outline">Stop Listening</button>
+        </div>
+        <div id="voiceBadge" class="status offline">Voice idle</div>
+        <p id="heardText" class="heard-text">No speech captured yet.</p>
+
+        <label for="targetInput">Object Goal</label>
+        <input id="targetInput" type="text" value="bottle" spellcheck="false" />
+        <div class="button-row">
+          <button id="startGoalBtn" class="btn btn-primary">Start Object Goal</button>
+          <button id="stopGoalBtn" class="btn btn-danger">Stop Agent</button>
+        </div>
+        <div id="agentBadge" class="status offline">Agent idle</div>
+      </section>
+
+      <section class="panel controls">
+        <h2>Movement</h2>
+        <p>Hold a direction. Release to auto-stop.</p>
+
+        <div class="move-grid">
+          <button id="btnForward" class="btn btn-move forward">Forward</button>
+          <button id="btnLeft" class="btn btn-move left">Turn Left</button>
+          <button id="btnRight" class="btn btn-move right">Turn Right</button>
+          <button id="btnBackward" class="btn btn-move backward">Backward</button>
+          <button id="btnStop" class="btn btn-danger stop">Stop</button>
+          <button id="btnLayDown" class="btn btn-outline laydown">Lay Down</button>
+          <button id="btnStandUp" class="btn btn-outline standup">Stand Up</button>
+        </div>
+      </section>
+
+      <section class="panel logs">
+        <h2>Logs</h2>
+        <pre id="logBox"></pre>
+      </section>
+    </main>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

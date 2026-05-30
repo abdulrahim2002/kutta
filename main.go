@@ -702,9 +702,6 @@ func (a *realtimeAgent) waitOrientationLocked(timeout time.Duration) (workerOrie
 		}
 		time.Sleep(rotatePollInterval)
 	}
-	if lastErr == nil {
-		lastErr = errors.New("orientation is not available")
-	}
 	return workerOrientation{}, lastErr
 }
 

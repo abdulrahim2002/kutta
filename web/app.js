@@ -496,29 +496,40 @@ function initSpeechRecognition() {
 
 async function submitVoiceTranscript(text) {
   try {
-    const payload = await requestJSON("/voice/command", {
+    const payload = await requestJSON("/agent/message", {
       method: "POST",
       body: JSON.stringify({ text }),
     });
 
-    const action = payload.action || { type: "noop" };
-    const source = payload.source || "fallback";
+    const reply = payload.reply || "";
     updateAgentUI(payload.agent || null);
 
-    if (action.type === "move") {
-      appendLog(`Voice(${source}): ${text} -> move ${action.command}`);
-    } else if (action.type === "agent_start") {
-      appendLog(`Voice(${source}): ${text} -> go to ${action.target}`);
-      if (action.target) {
-        elements.targetInput.value = action.target;
-      }
-    } else if (action.type === "agent_stop") {
-      appendLog(`Voice(${source}): ${text} -> stop agent`);
-    } else {
-      appendLog(`Voice(${source}): ${text} -> no action`);
+    if (reply) {
+      appendLog(`Agent: ${reply}`);
+    }
+
+    if (payload.audio) {
+      playAudio(payload.audio);
     }
   } catch (error) {
     appendLog(`Voice command failed: ${error.message}`, true);
+  }
+}
+
+function playAudio(base64Wav) {
+  try {
+    const binaryString = atob(base64Wav);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.play().catch((e) => appendLog(`Audio play failed: ${e.message}`, true));
+  } catch (e) {
+    appendLog(`Audio decode failed: ${e.message}`, true);
   }
 }
 

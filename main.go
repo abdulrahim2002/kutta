@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -240,6 +243,7 @@ type realtimeAgent struct {
 	lastFrameSentAt time.Time
 	goalCancel      context.CancelFunc
 	status          agentStatus
+	lastAudioBase64 string
 }
 
 func newRealtimeAgent(worker *workerClient) *realtimeAgent {
@@ -372,6 +376,7 @@ func (a *realtimeAgent) resetLocked() {
 		a.conn = nil
 	}
 	a.lastFrameSentAt = time.Time{}
+	a.lastAudioBase64 = ""
 	a.status.GoalActive = false
 	a.status.GoalTarget = ""
 	a.status.Running = false
@@ -414,7 +419,7 @@ func (a *realtimeAgent) Start(apiKey string) error {
 			"reasoning": map[string]any{
 				"effort": "high",
 			},
-			"output_modalities": []string{"text"},
+			"output_modalities": []string{"text", "audio"},
 			"instructions": strings.TrimSpace(
 				"You are the single control agent for a Unitree Go2 robot. " +
 					"Use tools for commands and goal control. " +
@@ -1010,7 +1015,7 @@ func (a *realtimeAgent) runTurnLocked(prompt string, includeImage bool, forceIma
 	createEvent := map[string]any{
 		"type": "response.create",
 		"response": map[string]any{
-			"output_modalities": []string{"text"},
+			"output_modalities": []string{"text", "audio"},
 		},
 	}
 	if err := a.writeJSONLocked(createEvent); err != nil {
@@ -1019,6 +1024,7 @@ func (a *realtimeAgent) runTurnLocked(prompt string, includeImage bool, forceIma
 	}
 
 	var reply strings.Builder
+	var audioBuf bytes.Buffer
 	timer := time.NewTimer(agentAskTimeout)
 	defer timer.Stop()
 	resetTimer := func() {
@@ -1060,6 +1066,14 @@ func (a *realtimeAgent) runTurnLocked(prompt string, includeImage bool, forceIma
 				reply.WriteString(delta)
 			}
 
+		case "response.audio.delta":
+			if delta, ok := event["delta"].(string); ok {
+				chunk, err := base64.StdEncoding.DecodeString(delta)
+				if err == nil {
+					audioBuf.Write(chunk)
+				}
+			}
+
 		case "response.done":
 			doneText, calls := parseResponseDone(event)
 			if doneText != "" {
@@ -1070,6 +1084,7 @@ func (a *realtimeAgent) runTurnLocked(prompt string, includeImage bool, forceIma
 			}
 
 			if len(calls) > 0 {
+				audioBuf.Reset()
 				for _, call := range calls {
 					output, toolErr := a.executeToolLocked(call)
 					if toolErr != nil {
@@ -1106,6 +1121,10 @@ func (a *realtimeAgent) runTurnLocked(prompt string, includeImage bool, forceIma
 			a.status.LastReply = final
 			a.status.LastError = ""
 			a.markUpdatedLocked()
+			if audioBuf.Len() > 0 {
+				wav := pcm16ToWAV(audioBuf.Bytes())
+				a.lastAudioBase64 = base64.StdEncoding.EncodeToString(wav)
+			}
 			return final, nil
 		}
 	}
@@ -1181,6 +1200,33 @@ func mustJSON(v any) string {
 	return string(data)
 }
 
+func pcm16ToWAV(pcm []byte) []byte {
+	sampleRate := 24000
+	bitsPerSample := 16
+	channels := 1
+	byteRate := sampleRate * channels * bitsPerSample / 8
+	blockAlign := channels * bitsPerSample / 8
+	dataSize := len(pcm)
+	fileSize := 36 + dataSize
+
+	buf := new(bytes.Buffer)
+	buf.WriteString("RIFF")
+	_ = binary.Write(buf, binary.LittleEndian, int32(fileSize))
+	buf.WriteString("WAVE")
+	buf.WriteString("fmt ")
+	_ = binary.Write(buf, binary.LittleEndian, int32(16))
+	_ = binary.Write(buf, binary.LittleEndian, int16(1))
+	_ = binary.Write(buf, binary.LittleEndian, int16(channels))
+	_ = binary.Write(buf, binary.LittleEndian, int32(sampleRate))
+	_ = binary.Write(buf, binary.LittleEndian, int32(byteRate))
+	_ = binary.Write(buf, binary.LittleEndian, int16(blockAlign))
+	_ = binary.Write(buf, binary.LittleEndian, int16(bitsPerSample))
+	buf.WriteString("data")
+	_ = binary.Write(buf, binary.LittleEndian, int32(dataSize))
+	buf.Write(pcm)
+	return buf.Bytes()
+}
+
 type apiResponse struct {
 	OK          bool               `json:"ok"`
 	Error       string             `json:"error,omitempty"`
@@ -1190,6 +1236,7 @@ type apiResponse struct {
 	Orientation *workerOrientation `json:"orientation,omitempty"`
 	Agent       *agentStatus       `json:"agent,omitempty"`
 	Reply       string             `json:"reply,omitempty"`
+	Audio       string             `json:"audio,omitempty"`
 }
 
 type connectRequest struct {
@@ -1376,11 +1423,17 @@ func (s *appServer) handleAgentMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.agent.mu.Lock()
+	audioB64 := s.agent.lastAudioBase64
+	s.agent.lastAudioBase64 = ""
+	s.agent.mu.Unlock()
+
 	robot, agent := s.snapshotStatus()
 	writeJSON(w, http.StatusOK, apiResponse{
 		OK:      true,
 		Message: "agent response",
 		Reply:   reply,
+		Audio:   audioB64,
 		Status:  &robot,
 		Agent:   &agent,
 	})

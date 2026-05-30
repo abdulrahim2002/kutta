@@ -2,32 +2,44 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
 	defaultRobotIP      = "10.174.16.11"
 	defaultPort         = "8080"
-	defaultGeminiModel  = "gemini-3.1-flash-live"
-	agentTickInterval   = 850 * time.Millisecond
-	agentRecoverTurnFor = 1200 * time.Millisecond
-	agentScanTurnFor    = 2400 * time.Millisecond
-	agentSearchStepFor  = 900 * time.Millisecond
+	defaultAgentModel   = "gpt-realtime-2"
+	realtimeWSBase      = "wss://api.openai.com/v1/realtime?model=%s"
+	agentAskTimeout     = 22 * time.Second
+	agentSetupTimeout   = 16 * time.Second
+	agentWriteTimeout   = 12 * time.Second
+	agentImageMinGap    = 1 * time.Second
+	goalTickInterval    = 1 * time.Second
+	minCommandDuration  = 150 * time.Millisecond * 5
+	maxCommandDuration  = 2500 * time.Millisecond * 5
+	defaultCommandDrive = 650 * time.Millisecond * 5
+	rotatePollInterval  = 90 * time.Millisecond
+	rotateSettleDelay   = 80 * time.Millisecond
+	rotateMinStep       = 120 * time.Millisecond
+	rotateMaxStep       = 560 * time.Millisecond
+	rotateMaxDuration   = 14 * time.Second
 )
 
 var allowedCommands = map[string]struct{}{
@@ -37,7 +49,6 @@ var allowedCommands = map[string]struct{}{
 	"right":    {},
 	"stop":     {},
 	"laydown":  {},
-	"standup":  {},
 }
 
 type workerRequest struct {
@@ -56,6 +67,18 @@ type workerResponse struct {
 type workerStatus struct {
 	Connected bool   `json:"connected"`
 	IP        string `json:"ip,omitempty"`
+}
+
+type workerOrientation struct {
+	Connected   bool    `json:"connected"`
+	IP          string  `json:"ip,omitempty"`
+	Valid       bool    `json:"valid"`
+	YawRad      float64 `json:"yaw_rad"`
+	RollRad     float64 `json:"roll_rad"`
+	PitchRad    float64 `json:"pitch_rad"`
+	YawSpeed    float64 `json:"yaw_speed"`
+	Source      string  `json:"source,omitempty"`
+	TimestampMS int64   `json:"timestamp_ms,omitempty"`
 }
 
 type videoFrame struct {
@@ -82,10 +105,7 @@ func newWorkerClient(scriptPath string) *workerClient {
 	if pythonBin == "" {
 		pythonBin = "python"
 	}
-	return &workerClient{
-		scriptPath: scriptPath,
-		pythonBin:  pythonBin,
-	}
+	return &workerClient{scriptPath: scriptPath, pythonBin: pythonBin}
 }
 
 func (c *workerClient) startLocked() error {
@@ -105,7 +125,6 @@ func (c *workerClient) startLocked() error {
 	}
 
 	cmd.Stderr = os.Stderr
-
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start worker with %q: %w", c.pythonBin, err)
 	}
@@ -137,12 +156,7 @@ func (c *workerClient) call(action string, params any, out any) error {
 	}
 
 	c.nextID++
-	req := workerRequest{
-		ID:     c.nextID,
-		Action: action,
-		Params: params,
-	}
-
+	req := workerRequest{ID: c.nextID, Action: action, Params: params}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("failed to encode worker request: %w", err)
@@ -195,580 +209,990 @@ func (c *workerClient) close() {
 	c.cleanupLocked()
 }
 
-type geminiClient struct {
-	apiKey     string
-	model      string
-	httpClient *http.Client
+type agentStatus struct {
+	Running       bool   `json:"running"`
+	Model         string `json:"model,omitempty"`
+	GoalActive    bool   `json:"goal_active"`
+	GoalTarget    string `json:"goal_target,omitempty"`
+	LastAction    string `json:"last_action,omitempty"`
+	LastReply     string `json:"last_reply,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
+	LastInputAt   string `json:"last_input_at,omitempty"`
+	LastUpdatedAt string `json:"last_updated_at,omitempty"`
 }
 
-func newGeminiClient() *geminiClient {
-	model := strings.TrimSpace(os.Getenv("GEMINI_MODEL"))
-	if model == "" {
-		model = defaultGeminiModel
-	}
+type toolCall struct {
+	Name      string
+	CallID    string
+	Arguments string
+}
 
-	return &geminiClient{
-		apiKey: strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
-		model:  model,
-		httpClient: &http.Client{
-			Timeout: 12 * time.Second,
+type realtimeAgent struct {
+	worker *workerClient
+
+	mu sync.Mutex
+
+	conn            *websocket.Conn
+	eventCh         chan map[string]any
+	readErrCh       chan error
+	apiKey          string
+	model           string
+	lastFrameSentAt time.Time
+	goalCancel      context.CancelFunc
+	status          agentStatus
+}
+
+func newRealtimeAgent(worker *workerClient) *realtimeAgent {
+	return &realtimeAgent{
+		worker: worker,
+		status: agentStatus{
+			Running:       false,
+			Model:         defaultAgentModel,
+			GoalActive:    false,
+			LastAction:    "idle",
+			LastReply:     "",
+			LastError:     "",
+			LastInputAt:   "",
+			LastUpdatedAt: time.Now().Format(time.RFC3339),
 		},
 	}
 }
 
-func (g *geminiClient) enabled() bool {
-	return g != nil && g.apiKey != ""
+func (a *realtimeAgent) snapshot() agentStatus {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.status
 }
 
-func (g *geminiClient) modelPath() string {
-	model := strings.TrimSpace(g.model)
-	if strings.HasPrefix(model, "models/") {
-		return model
-	}
-	return "models/" + model
+func (a *realtimeAgent) markUpdatedLocked() {
+	a.status.LastUpdatedAt = time.Now().Format(time.RFC3339)
 }
 
-type geminiResponse struct {
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-	} `json:"candidates"`
-	Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
+func (a *realtimeAgent) writeJSONLocked(v any) error {
+	if a.conn == nil {
+		return errors.New("agent websocket is not connected")
+	}
+	_ = a.conn.SetWriteDeadline(time.Now().Add(agentWriteTimeout))
+	err := a.conn.WriteJSON(v)
+	_ = a.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
-func (g *geminiClient) generateJSON(ctx context.Context, prompt, imageB64 string, out any) error {
-	if !g.enabled() {
-		return errors.New("gemini api key is not configured")
+func (a *realtimeAgent) startReadLoopLocked() {
+	if a.conn == nil {
+		return
 	}
 
-	parts := []map[string]any{
-		{"text": prompt},
-	}
-	if strings.TrimSpace(imageB64) != "" {
-		parts = append(parts, map[string]any{
-			"inline_data": map[string]any{
-				"mime_type": "image/jpeg",
-				"data":      imageB64,
-			},
-		})
-	}
+	eventCh := make(chan map[string]any, 256)
+	readErrCh := make(chan error, 1)
+	conn := a.conn
 
-	body := map[string]any{
-		"contents": []map[string]any{
-			{
-				"role":  "user",
-				"parts": parts,
-			},
-		},
-		"generationConfig": map[string]any{
-			"temperature":      0.1,
-			"maxOutputTokens":  256,
-			"responseMimeType": "application/json",
-		},
-	}
+	a.eventCh = eventCh
+	a.readErrCh = readErrCh
 
-	rawBody, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("failed to encode gemini request: %w", err)
-	}
+	go func() {
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				select {
+				case readErrCh <- err:
+				default:
+				}
+				close(eventCh)
+				return
+			}
 
-	endpoint := fmt.Sprintf(
-		"https://generativelanguage.googleapis.com/v1beta/%s:generateContent?key=%s",
-		g.modelPath(),
-		url.QueryEscape(g.apiKey),
-	)
+			var evt map[string]any
+			if err := json.Unmarshal(raw, &evt); err != nil {
+				continue
+			}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(rawBody))
-	if err != nil {
-		return fmt.Errorf("failed to build gemini request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := g.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("gemini request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read gemini response: %w", err)
-	}
-
-	var parsed geminiResponse
-	if err := json.Unmarshal(payload, &parsed); err != nil {
-		return fmt.Errorf("failed to decode gemini response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		if parsed.Error != nil && parsed.Error.Message != "" {
-			return fmt.Errorf("gemini http %d: %s", resp.StatusCode, parsed.Error.Message)
-		}
-		return fmt.Errorf("gemini http %d", resp.StatusCode)
-	}
-
-	if parsed.Error != nil && parsed.Error.Message != "" {
-		return errors.New(parsed.Error.Message)
-	}
-
-	text := ""
-	for _, candidate := range parsed.Candidates {
-		for _, part := range candidate.Content.Parts {
-			if strings.TrimSpace(part.Text) != "" {
-				text = part.Text
-				break
+			select {
+			case eventCh <- evt:
+			default:
+				// Keep the stream live under bursty event traffic by dropping one old event.
+				select {
+				case <-eventCh:
+				default:
+				}
+				select {
+				case eventCh <- evt:
+				default:
+				}
 			}
 		}
-		if text != "" {
-			break
+	}()
+}
+
+func (a *realtimeAgent) drainEventsLocked() {
+	if a.eventCh == nil {
+		return
+	}
+	for {
+		select {
+		case _, ok := <-a.eventCh:
+			if !ok {
+				return
+			}
+		default:
+			return
 		}
 	}
-	if text == "" {
-		return errors.New("gemini returned no text payload")
-	}
-
-	clean := extractJSONObject(text)
-	if err := json.Unmarshal([]byte(clean), out); err != nil {
-		return fmt.Errorf("gemini returned invalid json: %w; raw=%s", err, clean)
-	}
-	return nil
 }
 
-func extractJSONObject(raw string) string {
-	s := strings.TrimSpace(raw)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	s = strings.TrimSpace(s)
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start >= 0 && end > start {
-		return s[start : end+1]
-	}
-	return s
-}
-
-type voiceAction struct {
-	Type    string `json:"type"`
-	Command string `json:"command,omitempty"`
-	Target  string `json:"target,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-}
-
-func normalizeCommand(command string) string {
-	cmd := strings.ToLower(strings.TrimSpace(command))
+func normalizeCommand(raw string) string {
+	cmd := strings.ToLower(strings.TrimSpace(raw))
 	if _, ok := allowedCommands[cmd]; ok {
 		return cmd
 	}
 	return ""
 }
 
-func normalizeVoiceAction(action voiceAction) voiceAction {
-	action.Type = strings.ToLower(strings.TrimSpace(action.Type))
-	action.Command = normalizeCommand(action.Command)
-	action.Target = strings.ToLower(strings.TrimSpace(action.Target))
-	action.Reason = strings.TrimSpace(action.Reason)
+func chooseModel() string {
+	model := strings.TrimSpace(os.Getenv("OPENAI_REALTIME_MODEL"))
+	if model == "" {
+		model = strings.TrimSpace(os.Getenv("OPENAI_MODEL"))
+	}
+	if model == "" {
+		model = defaultAgentModel
+	}
+	return model
+}
 
-	switch action.Type {
-	case "move":
-		if action.Command == "" {
-			action.Type = "noop"
+func (a *realtimeAgent) resetLocked() {
+	if a.goalCancel != nil {
+		a.goalCancel()
+		a.goalCancel = nil
+	}
+	a.eventCh = nil
+	a.readErrCh = nil
+	if a.conn != nil {
+		_ = a.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(2*time.Second))
+		_ = a.conn.Close()
+		a.conn = nil
+	}
+	a.lastFrameSentAt = time.Time{}
+	a.status.GoalActive = false
+	a.status.GoalTarget = ""
+	a.status.Running = false
+	a.status.LastAction = "stopped"
+	a.markUpdatedLocked()
+}
+
+func (a *realtimeAgent) Start(apiKey string) error {
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	}
+	if key == "" {
+		return errors.New("OPENAI_API_KEY is required")
+	}
+
+	model := chooseModel()
+	wsURL := fmt.Sprintf(realtimeWSBase, url.QueryEscape(model))
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+key)
+	if sid := strings.TrimSpace(os.Getenv("OPENAI_SAFETY_IDENTIFIER")); sid != "" {
+		header.Set("OpenAI-Safety-Identifier", sid)
+	}
+
+	dialer := websocket.Dialer{HandshakeTimeout: agentSetupTimeout}
+	conn, resp, err := dialer.Dial(wsURL, header)
+	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("realtime dial failed: %w (http %s)", err, resp.Status)
 		}
-	case "agent_start":
-		if action.Target == "" {
-			action.Type = "noop"
-		}
-	case "agent_stop":
-	default:
-		action.Type = "noop"
-	}
-	return action
-}
-
-func (g *geminiClient) parseVoiceCommand(ctx context.Context, raw string) (voiceAction, string, error) {
-	if !g.enabled() {
-		return voiceAction{}, "", errors.New("GEMINI_API_KEY is missing")
+		return fmt.Errorf("realtime dial failed: %w", err)
 	}
 
-	prompt := fmt.Sprintf(
-		"Convert this robot voice command into JSON.\n"+
-			"Transcript: %q\n"+
-			"Return exactly one JSON object with schema:\n"+
-			"{\"type\":\"move|agent_start|agent_stop|noop\",\"command\":\"forward|backward|left|right|stop|laydown\",\"target\":\"string\",\"reason\":\"string\"}\n"+
-			"Rules:\n"+
-			"- Direct movement requests -> type=move.\n"+
-			"- Object goals like 'go to the bottle' -> type=agent_start and target='bottle'.\n"+
-			"- Stop autonomous behavior -> type=agent_stop.\n"+
-			"- Unknown request -> type=noop.\n"+
-			"Return JSON only.",
-		raw,
-	)
-
-	var action voiceAction
-	if err := g.generateJSON(ctx, prompt, "", &action); err != nil {
-		return voiceAction{}, "", fmt.Errorf("gemini voice parsing failed: %w", err)
-	}
-	return normalizeVoiceAction(action), "gemini", nil
-}
-
-type navigationDecision struct {
-	Action        string  `json:"action"`
-	TargetVisible bool    `json:"target_visible"`
-	ObstacleAhead bool    `json:"obstacle_ahead"`
-	Confidence    float64 `json:"confidence"`
-	Reason        string  `json:"reason"`
-}
-
-func normalizeNavigationAction(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "forward", "backward", "left", "right", "stop", "scan":
-		return strings.ToLower(strings.TrimSpace(raw))
-	default:
-		return "scan"
-	}
-}
-
-func (g *geminiClient) decideNavigation(ctx context.Context, target, imageB64, lastMotion string) (navigationDecision, error) {
-	if strings.TrimSpace(imageB64) == "" {
-		return navigationDecision{}, errors.New("no camera frame available for gemini navigation")
-	}
-	if !g.enabled() {
-		return navigationDecision{}, errors.New("GEMINI_API_KEY is missing")
-	}
-
-	prompt := fmt.Sprintf(
-		"You are a low-latency navigation policy for a quadruped robot.\n"+
-			"Goal object: %q\n"+
-			"Previous robot motion command: %q\n"+
-			"From the current camera frame, return one JSON object:\n"+
-			"{\"action\":\"forward|left|right|stop|scan\",\"target_visible\":bool,\"obstacle_ahead\":bool,\"confidence\":0..1,\"reason\":\"short\"}\n"+
-			"Policy:\n"+
-			"- If target not visible, scan by turning left or right.\n"+
-			"- If target visible and path appears clear, action=forward.\n"+
-			"- If immediate obstacle risk exists, obstacle_ahead=true and action left or right.\n"+
-			"- Be conservative around obstacles.\n"+
-			"Return JSON only.",
-		target,
-		lastMotion,
-	)
-
-	var decision navigationDecision
-	if err := g.generateJSON(ctx, prompt, imageB64, &decision); err != nil {
-		return navigationDecision{}, fmt.Errorf("gemini navigation failed: %w", err)
-	}
-	decision.Action = normalizeNavigationAction(decision.Action)
-	if decision.Confidence < 0 {
-		decision.Confidence = 0
-	}
-	if decision.Confidence > 1 {
-		decision.Confidence = 1
-	}
-	return decision, nil
-}
-
-type agentStatus struct {
-	Running    bool   `json:"running"`
-	Target     string `json:"target,omitempty"`
-	LastAction string `json:"last_action,omitempty"`
-	LastReason string `json:"last_reason,omitempty"`
-	LastError  string `json:"last_error,omitempty"`
-	Iteration  int    `json:"iteration,omitempty"`
-	UpdatedAt  string `json:"updated_at,omitempty"`
-}
-
-type agentController struct {
-	worker *workerClient
-	gemini *geminiClient
-
-	mu     sync.Mutex
-	status agentStatus
-	cancel context.CancelFunc
-	runID  int64
-}
-
-func newAgentController(worker *workerClient, gemini *geminiClient) *agentController {
-	return &agentController{
-		worker: worker,
-		gemini: gemini,
-		status: agentStatus{
-			Running:    false,
-			LastAction: "stop",
-			LastReason: "idle",
-			UpdatedAt:  time.Now().Format(time.RFC3339),
+	sessionUpdate := map[string]any{
+		"type": "session.update",
+		"session": map[string]any{
+			"type":  "realtime",
+			"model": model,
+			"reasoning": map[string]any{
+				"effort": "high",
+			},
+			"output_modalities": []string{"text"},
+			"instructions": strings.TrimSpace(
+				"You are the single control agent for a Unitree Go2 robot. " +
+					"Use tools for commands and goal control. " +
+					"For direct movement, call robot_command. " +
+					"For angle-precise turns, call robot_rotate. " +
+					"For long tasks like 'go to object', call start_object_goal. " +
+					"For user questions about the current view, answer clearly and concisely from the provided image. " +
+					"If uncertain about scene details, say so.",
+			),
+			"tool_choice": "auto",
+			"tools": []map[string]any{
+				{
+					"type":        "function",
+					"name":        "robot_command",
+					"description": "Send one robot motion command. Use short durations for incremental motion.",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"command": map[string]any{
+								"type": "string",
+								"enum": []string{"forward", "backward", "left", "right", "stop", "laydown"},
+							},
+							"duration_ms": map[string]any{
+								"type":        "integer",
+								"description": "Optional duration for movement commands. Ignored for stop/laydown.",
+							},
+						},
+						"required": []string{"command"},
+					},
+				},
+				{
+					"type":        "function",
+					"name":        "robot_rotate",
+					"description": "Rotate robot by a relative yaw angle using closed-loop orientation feedback from the robot state stream.",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"angle_deg": map[string]any{
+								"type":        "number",
+								"description": "Relative rotation angle in degrees. Positive turns left, negative turns right.",
+							},
+							"tolerance_deg": map[string]any{
+								"type":        "number",
+								"description": "Optional completion tolerance in degrees (default 7.5).",
+							},
+							"max_duration_ms": map[string]any{
+								"type":        "integer",
+								"description": "Optional timeout budget for this rotation.",
+							},
+						},
+						"required": []string{"angle_deg"},
+					},
+				},
+				{
+					"type":        "function",
+					"name":        "start_object_goal",
+					"description": "Start autonomous object-goal navigation loop.",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"target": map[string]any{
+								"type":        "string",
+								"description": "Object name to reach, like bottle, chair, box.",
+							},
+						},
+						"required": []string{"target"},
+					},
+				},
+				{
+					"type":        "function",
+					"name":        "stop_object_goal",
+					"description": "Stop autonomous object-goal navigation loop immediately.",
+					"parameters": map[string]any{
+						"type":       "object",
+						"properties": map[string]any{},
+					},
+				},
+				{
+					"type":        "function",
+					"name":        "get_robot_status",
+					"description": "Get robot connection and goal status.",
+					"parameters": map[string]any{
+						"type":       "object",
+						"properties": map[string]any{},
+					},
+				},
+			},
 		},
 	}
-}
 
-func (a *agentController) snapshot() agentStatus {
+	_ = conn.SetWriteDeadline(time.Now().Add(agentWriteTimeout))
+	if err := conn.WriteJSON(sessionUpdate); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("realtime session.update failed: %w", err)
+	}
+	_ = conn.SetWriteDeadline(time.Time{})
+
+	setupDeadline := time.Now().Add(agentSetupTimeout)
+	for {
+		_ = conn.SetReadDeadline(setupDeadline)
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("realtime setup read failed: %w", err)
+		}
+
+		var evt map[string]any
+		if err := json.Unmarshal(raw, &evt); err != nil {
+			continue
+		}
+
+		t, _ := evt["type"].(string)
+		if t == "session.updated" {
+			break
+		}
+		if t == "error" {
+			_ = conn.Close()
+			return fmt.Errorf("realtime setup error: %s", parseErrorMessage(evt))
+		}
+	}
+	// Clear temporary setup read deadline; the persistent read loop should not
+	// inherit this timeout.
+	_ = conn.SetReadDeadline(time.Time{})
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.status
-}
-
-func (a *agentController) updateIfCurrent(runID int64, mut func(s *agentStatus)) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if runID != a.runID || !a.status.Running {
-		return
-	}
-	mut(&a.status)
-	a.status.UpdatedAt = time.Now().Format(time.RFC3339)
-}
-
-func (a *agentController) Start(target string) error {
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return errors.New("target is required")
-	}
-	if !a.gemini.enabled() {
-		return errors.New("GEMINI_API_KEY is required for agent mode")
-	}
-
-	a.mu.Lock()
-	if a.cancel != nil {
-		a.cancel()
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	a.cancel = cancel
-	a.runID++
-	runID := a.runID
-	a.status = agentStatus{
-		Running:    true,
-		Target:     target,
-		LastAction: "scan",
-		LastReason: "agent started",
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-	}
-	a.mu.Unlock()
-
-	go a.run(ctx, runID, target)
+	a.resetLocked()
+	a.conn = conn
+	a.apiKey = key
+	a.model = model
+	a.status.Running = true
+	a.status.Model = model
+	a.status.LastAction = "agent_started"
+	a.status.LastError = ""
+	a.markUpdatedLocked()
+	a.startReadLoopLocked()
 	return nil
 }
 
-func (a *agentController) Stop() {
+func (a *realtimeAgent) Stop() {
 	a.mu.Lock()
-	cancel := a.cancel
-	wasRunning := a.status.Running
-	a.runID++
-	a.cancel = nil
-	a.status = agentStatus{
-		Running:    false,
-		LastAction: "stop",
-		LastReason: "agent stopped",
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-	}
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	a.resetLocked()
+}
 
-	if cancel != nil {
-		cancel()
+func (a *realtimeAgent) StopGoal() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopGoalLocked(true)
+}
+
+func (a *realtimeAgent) stopGoalLocked(sendStop bool) {
+	if a.goalCancel != nil {
+		a.goalCancel()
+		a.goalCancel = nil
 	}
-	if wasRunning {
+	a.status.GoalActive = false
+	a.status.GoalTarget = ""
+	if sendStop {
 		_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
 	}
+	a.status.LastAction = "goal_stopped"
+	a.markUpdatedLocked()
 }
 
-func (a *agentController) run(ctx context.Context, runID int64, target string) {
-	ticker := time.NewTicker(agentTickInterval)
-	defer ticker.Stop()
+func (a *realtimeAgent) startGoalLocked(target string) {
+	if a.goalCancel != nil {
+		a.goalCancel()
+		a.goalCancel = nil
+	}
 
-	lastMotion := "stop"
-	var recoveryUntil time.Time
-	recoveryTurn := ""
-	scanDirection := "left"
-	scanTurnUntil := time.Now().Add(agentScanTurnFor)
-	scanHalfSweeps := 0
-	var searchForwardUntil time.Time
+	ctx, cancel := context.WithCancel(context.Background())
+	a.goalCancel = cancel
+	a.status.GoalActive = true
+	a.status.GoalTarget = target
+	a.status.LastAction = "goal_started"
+	a.markUpdatedLocked()
 
+	go a.goalLoop(ctx, target)
+}
+
+func clampDuration(ms int) time.Duration {
+	if ms <= 0 {
+		return defaultCommandDrive
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d < minCommandDuration {
+		return minCommandDuration
+	}
+	if d > maxCommandDuration {
+		return maxCommandDuration
+	}
+	return d
+}
+
+func normalizeAngleRad(angle float64) float64 {
+	for angle > math.Pi {
+		angle -= 2.0 * math.Pi
+	}
+	for angle < -math.Pi {
+		angle += 2.0 * math.Pi
+	}
+	return angle
+}
+
+func radiansToDegrees(rad float64) float64 {
+	return rad * 180.0 / math.Pi
+}
+
+func clampRotateToleranceDeg(value float64) float64 {
+	if value == 0 {
+		return 7.5
+	}
+	if value < 2.0 {
+		return 2.0
+	}
+	if value > 25.0 {
+		return 25.0
+	}
+	return value
+}
+
+func rotateStepDuration(remainingDeg float64) time.Duration {
+	switch {
+	case remainingDeg <= 10.0:
+		return rotateMinStep
+	case remainingDeg >= 75.0:
+		return rotateMaxStep
+	default:
+		rangeDeg := 75.0 - 10.0
+		f := (remainingDeg - 10.0) / rangeDeg
+		return rotateMinStep + time.Duration(f*float64(rotateMaxStep-rotateMinStep))
+	}
+}
+
+func rotateTimeoutBudget(angleDeg float64, maxDurationMS int) time.Duration {
+	defaultBudget := time.Duration(2200+int(math.Abs(angleDeg)*38.0)) * time.Millisecond
+	if defaultBudget < 2*time.Second {
+		defaultBudget = 2 * time.Second
+	}
+	if defaultBudget > rotateMaxDuration {
+		defaultBudget = rotateMaxDuration
+	}
+
+	if maxDurationMS <= 0 {
+		return defaultBudget
+	}
+
+	override := time.Duration(maxDurationMS) * time.Millisecond
+	if override < 1200*time.Millisecond {
+		override = 1200 * time.Millisecond
+	}
+	if override > rotateMaxDuration {
+		override = rotateMaxDuration
+	}
+	return override
+}
+
+func (a *realtimeAgent) readOrientationLocked() (workerOrientation, error) {
+	var orientation workerOrientation
+	if err := a.worker.call("orientation", nil, &orientation); err != nil {
+		return orientation, err
+	}
+	if !orientation.Connected {
+		return orientation, errors.New("robot is not connected")
+	}
+	if !orientation.Valid {
+		return orientation, errors.New("orientation is not ready yet")
+	}
+	orientation.YawRad = normalizeAngleRad(orientation.YawRad)
+	return orientation, nil
+}
+
+func (a *realtimeAgent) waitOrientationLocked(timeout time.Duration) (workerOrientation, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for {
-		select {
-		case <-ctx.Done():
+		orientation, err := a.readOrientationLocked()
+		if err == nil {
+			return orientation, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(rotatePollInterval)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("orientation is not available")
+	}
+	return workerOrientation{}, lastErr
+}
+
+func (a *realtimeAgent) rotateByAngleLocked(angleDeg float64, toleranceDeg float64, maxDurationMS int) (map[string]any, error) {
+	if math.IsNaN(angleDeg) || math.IsInf(angleDeg, 0) {
+		return nil, errors.New("robot_rotate: angle_deg must be a finite number")
+	}
+	if angleDeg > 360.0 || angleDeg < -360.0 {
+		return nil, errors.New("robot_rotate: angle_deg must be between -360 and 360")
+	}
+
+	tolerance := clampRotateToleranceDeg(toleranceDeg)
+	if math.Abs(angleDeg) <= tolerance {
+		_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
+		return map[string]any{
+			"ok":              true,
+			"rotated_deg":     0.0,
+			"requested_deg":   angleDeg,
+			"final_error_deg": math.Abs(angleDeg),
+			"target_reached":  true,
+		}, nil
+	}
+
+	start, err := a.waitOrientationLocked(3 * time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("robot_rotate: %w", err)
+	}
+
+	targetYaw := normalizeAngleRad(start.YawRad + (angleDeg * math.Pi / 180.0))
+	deadline := time.Now().Add(rotateTimeoutBudget(angleDeg, maxDurationMS))
+	steps := 0
+	lastRemaining := 180.0
+
+	for time.Now().Before(deadline) {
+		current, err := a.readOrientationLocked()
+		if err != nil {
+			return nil, fmt.Errorf("robot_rotate orientation read failed: %w", err)
+		}
+
+		remainingRad := normalizeAngleRad(targetYaw - current.YawRad)
+		remainingDeg := math.Abs(radiansToDegrees(remainingRad))
+		lastRemaining = remainingDeg
+		if remainingDeg <= tolerance {
 			_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
-			return
-		case <-ticker.C:
-			command, reason, err := a.nextCommand(
-				ctx,
-				target,
-				lastMotion,
-				&recoveryUntil,
-				&recoveryTurn,
-				&scanDirection,
-				&scanTurnUntil,
-				&scanHalfSweeps,
-				&searchForwardUntil,
-			)
-			if err != nil {
-				_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
-				a.updateIfCurrent(runID, func(s *agentStatus) {
-					s.LastError = err.Error()
-					s.LastReason = "decision error"
-					s.LastAction = "stop"
-				})
-				continue
+			actualTurnDeg := radiansToDegrees(normalizeAngleRad(current.YawRad - start.YawRad))
+			a.status.LastAction = fmt.Sprintf("tool_robot_rotate_done_%.1fdeg", actualTurnDeg)
+			a.markUpdatedLocked()
+			return map[string]any{
+				"ok":              true,
+				"requested_deg":   angleDeg,
+				"rotated_deg":     actualTurnDeg,
+				"final_error_deg": remainingDeg,
+				"target_reached":  true,
+				"steps":           steps,
+			}, nil
+		}
+
+		command := "left"
+		if remainingRad < 0.0 {
+			command = "right"
+		}
+		if err := a.worker.call("command", map[string]string{"command": command}, nil); err != nil {
+			return nil, fmt.Errorf("robot_rotate command failed: %w", err)
+		}
+
+		time.Sleep(rotateStepDuration(remainingDeg))
+		_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
+		time.Sleep(rotateSettleDelay)
+		steps++
+	}
+
+	_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
+	a.status.LastAction = "tool_robot_rotate_timeout"
+	a.markUpdatedLocked()
+	return nil, fmt.Errorf("robot_rotate timeout: remaining %.1f deg", lastRemaining)
+}
+
+func (a *realtimeAgent) executeToolLocked(call toolCall) (string, error) {
+	switch call.Name {
+	case "robot_command":
+		var args struct {
+			Command    string `json:"command"`
+			DurationMS int    `json:"duration_ms,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			return "", fmt.Errorf("robot_command args invalid: %w", err)
+		}
+
+		cmd := normalizeCommand(args.Command)
+		if cmd == "" {
+			return "", errors.New("robot_command: unsupported command")
+		}
+
+		if err := a.worker.call("command", map[string]string{"command": cmd}, nil); err != nil {
+			return "", err
+		}
+
+		if cmd != "stop" && cmd != "laydown" {
+			time.Sleep(clampDuration(args.DurationMS))
+			_ = a.worker.call("command", map[string]string{"command": "stop"}, nil)
+		}
+
+		a.status.LastAction = "tool_robot_command_" + cmd
+		a.markUpdatedLocked()
+
+		return mustJSON(map[string]any{
+			"ok":      true,
+			"command": cmd,
+		}), nil
+
+	case "robot_rotate":
+		var args struct {
+			AngleDeg      float64 `json:"angle_deg"`
+			ToleranceDeg  float64 `json:"tolerance_deg,omitempty"`
+			MaxDurationMS int     `json:"max_duration_ms,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			return "", fmt.Errorf("robot_rotate args invalid: %w", err)
+		}
+
+		result, err := a.rotateByAngleLocked(args.AngleDeg, args.ToleranceDeg, args.MaxDurationMS)
+		if err != nil {
+			return "", err
+		}
+		return mustJSON(result), nil
+
+	case "start_object_goal":
+		var args struct {
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+			return "", fmt.Errorf("start_object_goal args invalid: %w", err)
+		}
+		target := strings.TrimSpace(strings.ToLower(args.Target))
+		if target == "" {
+			return "", errors.New("start_object_goal: target is required")
+		}
+
+		a.startGoalLocked(target)
+		return mustJSON(map[string]any{
+			"ok":          true,
+			"goal_active": true,
+			"target":      target,
+		}), nil
+
+	case "stop_object_goal":
+		a.stopGoalLocked(true)
+		return mustJSON(map[string]any{
+			"ok":          true,
+			"goal_active": false,
+		}), nil
+
+	case "get_robot_status":
+		var robot workerStatus
+		if err := a.worker.call("status", nil, &robot); err != nil {
+			return "", err
+		}
+
+		orientationData := map[string]any{
+			"valid": false,
+		}
+		var orientation workerOrientation
+		if err := a.worker.call("orientation", nil, &orientation); err == nil {
+			orientationData = map[string]any{
+				"valid":        orientation.Valid,
+				"yaw_deg":      radiansToDegrees(normalizeAngleRad(orientation.YawRad)),
+				"yaw_speed":    orientation.YawSpeed,
+				"source":       orientation.Source,
+				"timestamp_ms": orientation.TimestampMS,
 			}
-
-			if err := a.worker.call("command", map[string]string{"command": command}, nil); err != nil {
-				a.updateIfCurrent(runID, func(s *agentStatus) {
-					s.LastError = err.Error()
-					s.LastReason = "command send error"
-				})
-				continue
-			}
-
-			lastMotion = command
-			a.updateIfCurrent(runID, func(s *agentStatus) {
-				s.Iteration++
-				s.LastAction = command
-				s.LastReason = reason
-				s.LastError = ""
-			})
 		}
+
+		return mustJSON(map[string]any{
+			"ok":            true,
+			"connected":     robot.Connected,
+			"ip":            robot.IP,
+			"goal_active":   a.status.GoalActive,
+			"goal_target":   a.status.GoalTarget,
+			"last_action":   a.status.LastAction,
+			"orientation":   orientationData,
+			"agent_running": a.status.Running,
+		}), nil
 	}
+
+	return "", fmt.Errorf("unsupported tool: %s", call.Name)
 }
 
-func chooseTurnFromLast(last string) string {
-	if strings.EqualFold(last, "left") {
-		return "right"
-	}
-	return "left"
-}
-
-func chooseSearchCommand(
-	now time.Time,
-	scanDirection *string,
-	scanTurnUntil *time.Time,
-	scanHalfSweeps *int,
-	searchForwardUntil *time.Time,
-) (string, string) {
-	if now.Before(*searchForwardUntil) {
-		return "forward", "search probe forward"
-	}
-
-	dir := strings.ToLower(strings.TrimSpace(*scanDirection))
-	if dir != "left" && dir != "right" {
-		dir = "left"
-	}
-
-	if now.After(*scanTurnUntil) {
-		if dir == "left" {
-			dir = "right"
-		} else {
-			dir = "left"
-		}
-		*scanTurnUntil = now.Add(agentScanTurnFor)
-		*scanHalfSweeps++
-
-		// After each full left+right sweep, do a short forward probe.
-		if *scanHalfSweeps%2 == 0 {
-			*searchForwardUntil = now.Add(agentSearchStepFor)
-			*scanDirection = dir
-			return "forward", "target not visible, short forward probe"
-		}
-	}
-
-	*scanDirection = dir
-	return dir, "target not visible, scanning"
-}
-
-func (a *agentController) nextCommand(
-	ctx context.Context,
-	target string,
-	lastMotion string,
-	recoveryUntil *time.Time,
-	recoveryTurn *string,
-	scanDirection *string,
-	scanTurnUntil *time.Time,
-	scanHalfSweeps *int,
-	searchForwardUntil *time.Time,
-) (string, string, error) {
+func (a *realtimeAgent) nextImageDataURLLocked(force bool) (string, error) {
 	now := time.Now()
-	if now.Before(*recoveryUntil) && *recoveryTurn != "" {
-		return *recoveryTurn, "temporary recovery turn", nil
+	if !force && !a.lastFrameSentAt.IsZero() && now.Sub(a.lastFrameSentAt) < agentImageMinGap {
+		return "", nil
 	}
 
 	var frame videoFrame
 	if err := a.worker.call("video_frame", nil, &frame); err != nil {
-		command, reason := chooseSearchCommand(
-			now,
-			scanDirection,
-			scanTurnUntil,
-			scanHalfSweeps,
-			searchForwardUntil,
-		)
-		return command, "frame unavailable, " + reason, nil
+		return "", err
+	}
+	if strings.TrimSpace(frame.ImageB64) == "" {
+		return "", nil
 	}
 
-	decisionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
+	a.lastFrameSentAt = now
+	return "data:image/jpeg;base64," + frame.ImageB64, nil
+}
 
-	decision, err := a.gemini.decideNavigation(decisionCtx, target, frame.ImageB64, lastMotion)
+func parseErrorMessage(event map[string]any) string {
+	if em, ok := event["error"].(map[string]any); ok {
+		if msg, ok := em["message"].(string); ok && strings.TrimSpace(msg) != "" {
+			return strings.TrimSpace(msg)
+		}
+	}
+	if msg, ok := event["message"].(string); ok && strings.TrimSpace(msg) != "" {
+		return strings.TrimSpace(msg)
+	}
+	return "realtime error"
+}
+
+func parseResponseDone(event map[string]any) (string, []toolCall) {
+	response, _ := event["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+
+	toolCalls := make([]toolCall, 0)
+	textParts := make([]string, 0)
+
+	for _, item := range output {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		itemType, _ := m["type"].(string)
+		switch itemType {
+		case "function_call":
+			name, _ := m["name"].(string)
+			callID, _ := m["call_id"].(string)
+			args, _ := m["arguments"].(string)
+			if name != "" && callID != "" {
+				toolCalls = append(toolCalls, toolCall{Name: name, CallID: callID, Arguments: args})
+			}
+		case "message":
+			content, _ := m["content"].([]any)
+			for _, c := range content {
+				part, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				if text, ok := part["text"].(string); ok && strings.TrimSpace(text) != "" {
+					textParts = append(textParts, strings.TrimSpace(text))
+				}
+				if text, ok := part["transcript"].(string); ok && strings.TrimSpace(text) != "" {
+					textParts = append(textParts, strings.TrimSpace(text))
+				}
+			}
+		}
+	}
+
+	return strings.TrimSpace(strings.Join(textParts, "\n")), toolCalls
+}
+
+func (a *realtimeAgent) runTurnLocked(prompt string, includeImage bool, forceImage bool) (string, error) {
+	if a.conn == nil || !a.status.Running {
+		return "", errors.New("agent is not running")
+	}
+	if a.eventCh == nil || a.readErrCh == nil {
+		return "", errors.New("agent realtime stream is not ready")
+	}
+
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "", errors.New("input text is required")
+	}
+	a.drainEventsLocked()
+
+	content := make([]map[string]any, 0, 2)
+	content = append(content, map[string]any{
+		"type": "input_text",
+		"text": prompt,
+	})
+
+	if includeImage {
+		img, err := a.nextImageDataURLLocked(forceImage)
+		if err != nil {
+			a.status.LastError = fmt.Sprintf("frame fetch failed: %v", err)
+			a.markUpdatedLocked()
+		} else if img != "" {
+			content = append(content, map[string]any{
+				"type":      "input_image",
+				"image_url": img,
+			})
+		}
+	}
+
+	msgEvent := map[string]any{
+		"type": "conversation.item.create",
+		"item": map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": content,
+		},
+	}
+	if err := a.writeJSONLocked(msgEvent); err != nil {
+		a.resetLocked()
+		return "", fmt.Errorf("send conversation item failed: %w", err)
+	}
+
+	createEvent := map[string]any{
+		"type": "response.create",
+		"response": map[string]any{
+			"output_modalities": []string{"text"},
+		},
+	}
+	if err := a.writeJSONLocked(createEvent); err != nil {
+		a.resetLocked()
+		return "", fmt.Errorf("send response.create failed: %w", err)
+	}
+
+	var reply strings.Builder
+	timer := time.NewTimer(agentAskTimeout)
+	defer timer.Stop()
+	resetTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(agentAskTimeout)
+	}
+
+	for {
+		var event map[string]any
+		select {
+		case <-timer.C:
+			return "", errors.New("realtime response timeout")
+		case err := <-a.readErrCh:
+			a.resetLocked()
+			if err == nil {
+				return "", errors.New("realtime read failed: connection closed")
+			}
+			return "", fmt.Errorf("realtime read failed: %w", err)
+		case evt, ok := <-a.eventCh:
+			if !ok {
+				a.resetLocked()
+				return "", errors.New("realtime read failed: connection closed")
+			}
+			event = evt
+		}
+
+		evtType, _ := event["type"].(string)
+		switch evtType {
+		case "error":
+			return "", errors.New(parseErrorMessage(event))
+
+		case "response.output_text.delta":
+			if delta, ok := event["delta"].(string); ok {
+				reply.WriteString(delta)
+			}
+
+		case "response.done":
+			doneText, calls := parseResponseDone(event)
+			if doneText != "" {
+				if reply.Len() > 0 {
+					reply.WriteByte('\n')
+				}
+				reply.WriteString(doneText)
+			}
+
+			if len(calls) > 0 {
+				for _, call := range calls {
+					output, toolErr := a.executeToolLocked(call)
+					if toolErr != nil {
+						output = mustJSON(map[string]any{
+							"ok":    false,
+							"error": toolErr.Error(),
+						})
+						a.status.LastError = toolErr.Error()
+					}
+
+					outputEvent := map[string]any{
+						"type": "conversation.item.create",
+						"item": map[string]any{
+							"type":    "function_call_output",
+							"call_id": call.CallID,
+							"output":  output,
+						},
+					}
+					if err := a.writeJSONLocked(outputEvent); err != nil {
+						a.resetLocked()
+						return "", fmt.Errorf("send function_call_output failed: %w", err)
+					}
+				}
+
+				if err := a.writeJSONLocked(createEvent); err != nil {
+					a.resetLocked()
+					return "", fmt.Errorf("send follow-up response.create failed: %w", err)
+				}
+				resetTimer()
+				continue
+			}
+
+			final := strings.TrimSpace(reply.String())
+			a.status.LastReply = final
+			a.status.LastError = ""
+			a.markUpdatedLocked()
+			return final, nil
+		}
+	}
+}
+
+func (a *realtimeAgent) goalLoop(ctx context.Context, target string) {
+	ticker := time.NewTicker(goalTickInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			prompt := fmt.Sprintf(
+				"Autonomous object goal is active. Target object: %q.\n"+
+					"Analyze the latest image and decide the next safe robot action.\n"+
+					"Always use tools only:\n"+
+					"- call robot_command for incremental movement,\n"+
+					"- call robot_rotate for controlled angle turns,\n"+
+					"- call stop_object_goal when target is reached or cannot be safely approached. "+
+					"(An object is reached, when the object touches the center of the lower edge of "+
+					"the picture. "+
+					"And tell, when it is reached, or not reachable!)\n"+
+					"Avoid obstacles by choosing alternative paths.",
+				//"Prefer short, safe steps and avoid obstacles.",
+				target,
+			)
+
+			a.mu.Lock()
+			if !a.status.Running || !a.status.GoalActive || a.status.GoalTarget != target {
+				a.mu.Unlock()
+				return
+			}
+
+			_, err := a.runTurnLocked(prompt, true, true)
+			if err != nil {
+				a.status.LastError = err.Error()
+				a.stopGoalLocked(true)
+				a.markUpdatedLocked()
+				a.mu.Unlock()
+				return
+			}
+			a.mu.Unlock()
+		}
+	}
+}
+
+func (a *realtimeAgent) SendUserInput(text string) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if !a.status.Running {
+		return "", errors.New("agent is not running")
+	}
+
+	a.status.LastInputAt = time.Now().Format(time.RFC3339)
+	reply, err := a.runTurnLocked(text, true, false)
 	if err != nil {
-		return "", "", err
+		a.status.LastError = err.Error()
+		a.markUpdatedLocked()
+		return "", err
 	}
+	a.markUpdatedLocked()
+	return reply, nil
+}
 
-	command := normalizeNavigationAction(decision.Action)
-	if command == "scan" {
-		command = chooseTurnFromLast(lastMotion)
+func mustJSON(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return "{\"ok\":false,\"error\":\"json encode failed\"}"
 	}
-	command = normalizeCommand(command)
-	if command == "" {
-		command = chooseTurnFromLast(lastMotion)
-	}
-
-	if decision.ObstacleAhead {
-		*recoveryTurn = chooseTurnFromLast(lastMotion)
-		*recoveryUntil = now.Add(agentRecoverTurnFor)
-		*searchForwardUntil = time.Time{}
-		return *recoveryTurn, "obstacle ahead, recovery turn", nil
-	}
-
-	if !decision.TargetVisible {
-		scanCommand, scanReason := chooseSearchCommand(
-			now,
-			scanDirection,
-			scanTurnUntil,
-			scanHalfSweeps,
-			searchForwardUntil,
-		)
-		return scanCommand, scanReason, nil
-	}
-
-	// Target found: reset scan counters and move toward target.
-	*scanHalfSweeps = 0
-	*searchForwardUntil = time.Time{}
-
-	if command == "scan" || command == "stop" {
-		command = "forward"
-	}
-	if command == "backward" {
-		command = chooseTurnFromLast(lastMotion)
-	}
-
-	if command == "" {
-		command = "forward"
-	}
-	reason := strings.TrimSpace(decision.Reason)
-	if reason == "" {
-		reason = "navigation decision"
-	}
-	return command, reason, nil
+	return string(data)
 }
 
 type apiResponse struct {
-	OK           bool          `json:"ok"`
-	Error        string        `json:"error,omitempty"`
-	Message      string        `json:"message,omitempty"`
-	Status       *workerStatus `json:"status,omitempty"`
-	Video        *videoFrame   `json:"video,omitempty"`
-	Action       *voiceAction  `json:"action,omitempty"`
-	Agent        *agentStatus  `json:"agent,omitempty"`
-	GeminiModel  string        `json:"gemini_model,omitempty"`
-	GeminiActive bool          `json:"gemini_active,omitempty"`
-	Source       string        `json:"source,omitempty"`
+	OK          bool               `json:"ok"`
+	Error       string             `json:"error,omitempty"`
+	Message     string             `json:"message,omitempty"`
+	Status      *workerStatus      `json:"status,omitempty"`
+	Video       *videoFrame        `json:"video,omitempty"`
+	Orientation *workerOrientation `json:"orientation,omitempty"`
+	Agent       *agentStatus       `json:"agent,omitempty"`
+	Reply       string             `json:"reply,omitempty"`
 }
 
 type connectRequest struct {
@@ -776,22 +1200,23 @@ type connectRequest struct {
 	AESKey string `json:"aesKey"`
 }
 
-type commandRequest struct {
-	Command string `json:"command"`
-}
-
-type voiceRequest struct {
-	Text string `json:"text"`
-}
-
 type agentStartRequest struct {
-	Target string `json:"target"`
+	APIKey string `json:"apiKey"`
+}
+
+type textRequest struct {
+	Text string `json:"text"`
 }
 
 type appServer struct {
 	worker *workerClient
-	gemini *geminiClient
-	agent  *agentController
+	agent  *realtimeAgent
+}
+
+func (s *appServer) snapshotStatus() (workerStatus, agentStatus) {
+	var robot workerStatus
+	_ = s.worker.call("status", nil, &robot)
+	return robot, s.agent.snapshot()
 }
 
 func (s *appServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -800,20 +1225,14 @@ func (s *appServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var status workerStatus
-	if err := s.worker.call("status", nil, &status); err != nil {
+	var robot workerStatus
+	if err := s.worker.call("status", nil, &robot); err != nil {
 		writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: err.Error()})
 		return
 	}
 
-	agentStatus := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{
-		OK:           true,
-		Status:       &status,
-		Agent:        &agentStatus,
-		GeminiModel:  s.gemini.model,
-		GeminiActive: s.gemini.enabled(),
-	})
+	agent := s.agent.snapshot()
+	writeJSON(w, http.StatusOK, apiResponse{OK: true, Status: &robot, Agent: &agent})
 }
 
 func (s *appServer) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -833,19 +1252,17 @@ func (s *appServer) handleConnect(w http.ResponseWriter, r *http.Request) {
 		ip = defaultRobotIP
 	}
 
-	params := map[string]string{
-		"ip":      ip,
-		"aes_key": strings.TrimSpace(req.AESKey),
-	}
+	// Force a clean agent session whenever robot transport changes.
+	s.agent.Stop()
 
 	var status workerStatus
-	if err := s.worker.call("connect", params, &status); err != nil {
+	if err := s.worker.call("connect", map[string]string{"ip": ip, "aes_key": strings.TrimSpace(req.AESKey)}, &status); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
 		return
 	}
 
-	agentStatus := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{OK: true, Status: &status, Agent: &agentStatus})
+	agent := s.agent.snapshot()
+	writeJSON(w, http.StatusOK, apiResponse{OK: true, Status: &status, Agent: &agent})
 }
 
 func (s *appServer) handleDisconnect(w http.ResponseWriter, r *http.Request) {
@@ -862,45 +1279,8 @@ func (s *appServer) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	agentStatus := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{OK: true, Status: &status, Agent: &agentStatus})
-}
-
-func (s *appServer) handleCommand(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{OK: false, Error: "method not allowed"})
-		return
-	}
-
-	var req commandRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
-		return
-	}
-
-	command := normalizeCommand(req.Command)
-	if command == "" {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "unsupported command"})
-		return
-	}
-
-	// Manual command overrides autonomous navigation.
-	s.agent.Stop()
-
-	if err := s.worker.call("command", map[string]string{"command": command}, nil); err != nil {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
-		return
-	}
-
-	var status workerStatus
-	_ = s.worker.call("status", nil, &status)
-	agentStatus := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{
-		OK:      true,
-		Status:  &status,
-		Agent:   &agentStatus,
-		Message: "command sent",
-	})
+	agent := s.agent.snapshot()
+	writeJSON(w, http.StatusOK, apiResponse{OK: true, Status: &status, Agent: &agent})
 }
 
 func (s *appServer) handleVideoFrame(w http.ResponseWriter, r *http.Request) {
@@ -918,67 +1298,19 @@ func (s *appServer) handleVideoFrame(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, apiResponse{OK: true, Video: &frame})
 }
 
-func (s *appServer) handleVoiceCommand(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+func (s *appServer) handleOrientation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{OK: false, Error: "method not allowed"})
 		return
 	}
 
-	var req voiceRequest
-	if err := decodeJSON(r, &req); err != nil {
+	var orientation workerOrientation
+	if err := s.worker.call("orientation", nil, &orientation); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
 		return
 	}
 
-	text := strings.TrimSpace(req.Text)
-	if text == "" {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "text is required"})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	action, source, err := s.gemini.parseVoiceCommand(ctx, text)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, apiResponse{
-			OK:    false,
-			Error: err.Error(),
-		})
-		return
-	}
-	action = normalizeVoiceAction(action)
-
-	switch action.Type {
-	case "move":
-		s.agent.Stop()
-		if err := s.worker.call("command", map[string]string{"command": action.Command}, nil); err != nil {
-			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
-			return
-		}
-	case "agent_start":
-		if err := s.agent.Start(action.Target); err != nil {
-			writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
-			return
-		}
-	case "agent_stop":
-		s.agent.Stop()
-	case "noop":
-	default:
-		action.Type = "noop"
-	}
-
-	var status workerStatus
-	_ = s.worker.call("status", nil, &status)
-	agentStatus := s.agent.snapshot()
-
-	writeJSON(w, http.StatusOK, apiResponse{
-		OK:      true,
-		Status:  &status,
-		Action:  &action,
-		Agent:   &agentStatus,
-		Source:  source,
-		Message: "voice command processed",
-	})
+	writeJSON(w, http.StatusOK, apiResponse{OK: true, Orientation: &orientation})
 }
 
 func (s *appServer) handleAgentStart(w http.ResponseWriter, r *http.Request) {
@@ -993,23 +1325,23 @@ func (s *appServer) handleAgentStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := strings.TrimSpace(req.Target)
-	if target == "" {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "target is required"})
+	var robot workerStatus
+	if err := s.worker.call("status", nil, &robot); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{OK: false, Error: err.Error()})
+		return
+	}
+	if !robot.Connected {
+		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "robot is not connected"})
 		return
 	}
 
-	if err := s.agent.Start(target); err != nil {
-		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
+	if err := s.agent.Start(req.APIKey); err != nil {
+		writeJSON(w, http.StatusBadGateway, apiResponse{OK: false, Error: err.Error()})
 		return
 	}
 
-	status := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{
-		OK:      true,
-		Agent:   &status,
-		Message: "agent started",
-	})
+	robot, agent := s.snapshotStatus()
+	writeJSON(w, http.StatusOK, apiResponse{OK: true, Message: "agent started", Status: &robot, Agent: &agent})
 }
 
 func (s *appServer) handleAgentStop(w http.ResponseWriter, r *http.Request) {
@@ -1019,22 +1351,42 @@ func (s *appServer) handleAgentStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.agent.Stop()
-	status := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{
-		OK:      true,
-		Agent:   &status,
-		Message: "agent stopped",
-	})
+	robot, agent := s.snapshotStatus()
+	writeJSON(w, http.StatusOK, apiResponse{OK: true, Message: "agent stopped", Status: &robot, Agent: &agent})
 }
 
-func (s *appServer) handleAgentStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (s *appServer) handleAgentMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{OK: false, Error: "method not allowed"})
 		return
 	}
 
-	status := s.agent.snapshot()
-	writeJSON(w, http.StatusOK, apiResponse{OK: true, Agent: &status})
+	var req textRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{OK: false, Error: "text is required"})
+		return
+	}
+
+	reply, err := s.agent.SendUserInput(text)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, apiResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	robot, agent := s.snapshotStatus()
+	writeJSON(w, http.StatusOK, apiResponse{
+		OK:      true,
+		Message: "agent response",
+		Reply:   reply,
+		Status:  &robot,
+		Agent:   &agent,
+	})
 }
 
 func decodeJSON(r *http.Request, target any) error {
@@ -1043,6 +1395,11 @@ func decodeJSON(r *http.Request, target any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(target); err != nil {
 		return fmt.Errorf("invalid json body: %w", err)
+	}
+
+	var extra struct{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("invalid json body: trailing data")
 	}
 	return nil
 }
@@ -1053,62 +1410,71 @@ func writeJSON(w http.ResponseWriter, code int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func normalizeBasePath(raw string) string {
-	base := "/" + strings.Trim(strings.TrimSpace(raw), "/")
-	if base == "/" {
-		return ""
+func joinPrefix(prefix, path string) string {
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		return path
 	}
-	return base
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = strings.TrimSuffix(p, "/")
+	return p + path
 }
 
-func uniqueSortedStrings(values []string) []string {
-	seen := make(map[string]struct{}, len(values))
-	out := make([]string, 0, len(values))
-	for _, v := range values {
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func joinPrefix(prefix, suffix string) string {
-	if prefix == "" {
-		return suffix
-	}
-	return prefix + suffix
-}
-
-func registerRoutes(mux *http.ServeMux, server *appServer, webDir string, prefix string) {
+func registerRoutes(mux *http.ServeMux, server *appServer, webDir, prefix string) {
 	mux.HandleFunc(joinPrefix(prefix, "/api/status"), server.handleStatus)
 	mux.HandleFunc(joinPrefix(prefix, "/api/connect"), server.handleConnect)
 	mux.HandleFunc(joinPrefix(prefix, "/api/disconnect"), server.handleDisconnect)
-	mux.HandleFunc(joinPrefix(prefix, "/api/command"), server.handleCommand)
 	mux.HandleFunc(joinPrefix(prefix, "/api/video/frame"), server.handleVideoFrame)
-	mux.HandleFunc(joinPrefix(prefix, "/api/voice/command"), server.handleVoiceCommand)
+	mux.HandleFunc(joinPrefix(prefix, "/api/orientation"), server.handleOrientation)
 	mux.HandleFunc(joinPrefix(prefix, "/api/agent/start"), server.handleAgentStart)
 	mux.HandleFunc(joinPrefix(prefix, "/api/agent/stop"), server.handleAgentStop)
-	mux.HandleFunc(joinPrefix(prefix, "/api/agent/status"), server.handleAgentStatus)
+	mux.HandleFunc(joinPrefix(prefix, "/api/agent/message"), server.handleAgentMessage)
 
-	fileServer := http.FileServer(http.Dir(webDir))
-	if prefix == "" {
-		// Root deployment: serve UI directly at "/".
-		mux.Handle("/", fileServer)
-		return
-	}
+	webBase := joinPrefix(prefix, "/web/")
+	fileHandler := http.StripPrefix(webBase, http.FileServer(http.Dir(webDir)))
+	mux.Handle(webBase, fileHandler)
 
-	// Prefixed deployment: serve UI at "<prefix>/web/".
-	webMount := joinPrefix(prefix, "/web/")
-	mux.Handle(webMount, http.StripPrefix(webMount, fileServer))
-	mux.HandleFunc(strings.TrimSuffix(webMount, "/"), func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, webMount, http.StatusTemporaryRedirect)
+	mux.HandleFunc(strings.TrimSuffix(webBase, "/"), func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, webBase, http.StatusMovedPermanently)
 	})
+
+	if prefix == "" {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, "/web/", http.StatusFound)
+		})
+	} else {
+		p := strings.TrimSuffix(prefix, "/")
+		mux.HandleFunc(p, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != p {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, webBase, http.StatusFound)
+		})
+		mux.HandleFunc(p+"/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != p+"/" {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, webBase, http.StatusFound)
+		})
+	}
 }
 
 func main() {
+	if runtime.GOOS == "windows" {
+		log.Fatal(
+			"This server is configured to run from WSL/Linux only. " +
+				"Refusing to start on native Windows to avoid a second server instance.",
+		)
+	}
+
 	workerScript := filepath.Join("worker", "unitree_worker.py")
 	if _, err := os.Stat(workerScript); err != nil {
 		log.Fatalf("worker script not found at %s: %v", workerScript, err)
@@ -1117,32 +1483,23 @@ func main() {
 	worker := newWorkerClient(workerScript)
 	defer worker.close()
 
-	// Start the worker early so startup issues are visible right away.
 	var startupStatus workerStatus
 	if err := worker.call("status", nil, &startupStatus); err != nil {
 		log.Fatalf("failed to start worker: %v", err)
 	}
 
-	gemini := newGeminiClient()
-	agent := newAgentController(worker, gemini)
+	agent := newRealtimeAgent(worker)
 	defer agent.Stop()
 
 	server := &appServer{
 		worker: worker,
-		gemini: gemini,
 		agent:  agent,
 	}
 
 	mux := http.NewServeMux()
 	webDir := filepath.Join(".", "web")
-
-	// Always expose root routes, and optionally expose a prefixed route set.
-	// Example: BASE_PATH=/robot gives /robot/web/ and /robot/api/*.
-	basePath := normalizeBasePath(os.Getenv("BASE_PATH"))
-	prefixes := uniqueSortedStrings([]string{"", "/robot", basePath})
-	for _, prefix := range prefixes {
-		registerRoutes(mux, server, webDir, prefix)
-	}
+	registerRoutes(mux, server, webDir, "")
+	registerRoutes(mux, server, webDir, "/robot")
 
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -1151,14 +1508,11 @@ func main() {
 
 	addr := ":" + port
 	log.Printf("Server listening on http://localhost%s", addr)
-	log.Printf("Gemini model: %s | enabled: %v", gemini.model, gemini.enabled())
-	for _, prefix := range prefixes {
-		if prefix == "" {
-			log.Printf("UI: http://localhost%s/ | API: http://localhost%s/api/*", addr, addr)
-		} else {
-			log.Printf("UI: http://localhost%s%s/web/ | API: http://localhost%s%s/api/*", addr, prefix, addr, prefix)
-		}
-	}
+	log.Printf("Robot default IP: %s", defaultRobotIP)
+	log.Printf("OpenAI realtime model: %s", chooseModel())
+	log.Printf("UI: http://localhost%s/web/ | API: http://localhost%s/api/*", addr, addr)
+	log.Printf("UI: http://localhost%s/robot/web/ | API: http://localhost%s/robot/api/*", addr, addr)
+
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
